@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Run `az login` with the browser (auth code) flow on a headless machine.
+# Open the printed URL in any browser, then paste the localhost redirect URL back here.
+# All arguments are passed through to `az login`.
+set -euo pipefail
+
+tmp=$(mktemp -d)
+pid=
+cleanup() {
+  [[ -n "$pid" ]] && kill -- "-$pid" 2>/dev/null
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+# Fake browser: az only needs webbrowser.get() to succeed; we just capture the URL.
+cat >"$tmp/browser" <<SH
+#!/bin/sh
+printf '%s\n' "\$1" >"$tmp/url"
+SH
+chmod +x "$tmp/browser"
+
+# Own process group so cleanup can kill az's python child too.
+BROWSER="$tmp/browser" setsid az login "$@" </dev/null &
+pid=$!
+
+while [[ ! -s "$tmp/url" ]]; do
+  if ! kill -0 "$pid" 2>/dev/null; then
+    status=0; wait "$pid" || status=$?; pid=; exit "$status"
+  fi
+  sleep 0.2
+done
+
+# MSAL asks for form_post (code in a POST body). Ask for query instead so the
+# code lands in the address bar; we POST it to the local listener ourselves.
+url=$(sed 's/response_mode=form_post/response_mode=query/' "$tmp/url")
+
+cat >&2 <<MSG
+
+Open this URL in a browser and sign in:
+
+$url
+
+The browser will then fail to load http://localhost:<port>/?code=...
+Copy that full URL from the address bar and paste it here.
+
+MSG
+
+while :; do
+  read -r -p "Redirect URL: " redirect || exit 1
+  [[ "$redirect" =~ ^http://localhost:([0-9]+)/?\?(.+)$ ]] && break
+  echo "Expected http://localhost:<port>/?code=..." >&2
+done
+port=${BASH_REMATCH[1]}
+query=${BASH_REMATCH[2]%%#*}
+
+curl -sS -o /dev/null --data "$query" "http://localhost:$port/" ||
+  echo "warning: delivering redirect to az failed" >&2
+
+status=0
+wait "$pid" || status=$?
+pid=
+exit "$status"
